@@ -1,0 +1,88 @@
+name: Sync forks
+
+on:
+  schedule:
+    - cron: '17 20 * * *' # 每天北京时间 04:17
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-forks
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ${{ matrix.repo }}
+    runs-on: ubuntu-slim
+
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        repo: ${{ fromJSON(vars.FORK_REPOS) }}
+
+    steps:
+      - name: Check and sync branches and tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          TARGET_REPO: ${{ matrix.repo }}
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::请配置 FORK_SYNC_TOKEN secret"
+            exit 1
+          fi
+
+          UPSTREAM="$(gh api "repos/$TARGET_REPO" \
+            --jq '.parent.clone_url // empty')"
+
+          if [[ -z "$UPSTREAM" ]]; then
+            echo "::error::$TARGET_REPO 不是 fork 仓库"
+            exit 1
+          fi
+
+          # 仅在本次任务的临时 runner 中配置认证
+          gh auth setup-git
+
+          TARGET_URL="https://github.com/$TARGET_REPO.git"
+          SYNC_DIR="$(mktemp -d "$RUNNER_TEMP/fork-sync.XXXXXX")"
+
+          # 只查询引用，不下载 Git 对象。--refs 排除附注 tag 的剥离行。
+          git ls-remote --refs "$UPSTREAM" \
+            'refs/heads/*' 'refs/tags/*' > "$SYNC_DIR/upstream.refs"
+          git ls-remote --refs "$TARGET_URL" \
+            'refs/heads/*' 'refs/tags/*' > "$SYNC_DIR/fork.refs"
+
+          # 仅检查上游存在的引用；fork 独有的引用不构成同步条件。
+          # 使用 FILENAME 判断文件，兼容目标仓库没有任何引用的情况。
+          awk '
+            FILENAME == ARGV[1] { target[$2] = $1; next }
+            target[$2] != $1 { print $2 }
+          ' "$SYNC_DIR/fork.refs" "$SYNC_DIR/upstream.refs" \
+            > "$SYNC_DIR/changed.refs"
+
+          if [[ ! -s "$SYNC_DIR/changed.refs" ]]; then
+            echo "无需同步：$TARGET_REPO 的上游引用均已一致。"
+            exit 0
+          fi
+
+          echo "以下引用存在差异："
+          cat "$SYNC_DIR/changed.refs"
+          echo "同步方向：$UPSTREAM -> $TARGET_REPO"
+
+          # 仅在检查到差异后下载所有分支和 tags
+          git init --bare "$SYNC_DIR/repository.git"
+          cd "$SYNC_DIR/repository.git"
+
+          git fetch --no-tags "$UPSTREAM" \
+            'refs/heads/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
+
+          # 不强制覆盖、不删除目标引用；任一更新失败则本次全部不更新。
+          git push --atomic "$TARGET_URL" \
+            'refs/heads/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
