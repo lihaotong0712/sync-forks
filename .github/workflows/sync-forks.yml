@@ -16,6 +16,16 @@ jobs:
     name: Sync ${{ matrix.repo }}
     runs-on: ubuntu-slim
 
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+      TARGET_REPO: ${{ matrix.repo }}
+      TARGET_URL: https://github.com/${{ matrix.repo }}.git
+      GIT_TERMINAL_PROMPT: '0'
+
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -23,19 +33,25 @@ jobs:
         repo: ${{ fromJSON(vars.FORK_REPOS) }}
 
     steps:
-      - name: Check and sync branches and tags
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
-          TARGET_REPO: ${{ matrix.repo }}
-          GIT_TERMINAL_PROMPT: '0'
+      - name: Validate token and prepare workspace
+        id: prepare
         run: |
           set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
 
           if [[ -z "$GH_TOKEN" ]]; then
             echo "::error::请配置 FORK_SYNC_TOKEN secret"
             exit 1
           fi
+
+          SYNC_DIR="$(mktemp -d "$RUNNER_TEMP/fork-sync.XXXXXX")"
+          printf 'SYNC_DIR=%s\n' "$SYNC_DIR" >> "$GITHUB_ENV"
+
+      - name: Resolve upstream repository
+        id: upstream
+        run: |
+          set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
 
           UPSTREAM="$(gh api "repos/$TARGET_REPO" \
             --jq '.parent.clone_url // empty')"
@@ -45,11 +61,22 @@ jobs:
             exit 1
           fi
 
+          printf 'UPSTREAM=%s\n' "$UPSTREAM" >> "$GITHUB_ENV"
+
+      - name: Configure Git authentication
+        id: auth
+        run: |
+          set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
+
           # 仅在本次任务的临时 runner 中配置认证
           gh auth setup-git
 
-          TARGET_URL="https://github.com/$TARGET_REPO.git"
-          SYNC_DIR="$(mktemp -d "$RUNNER_TEMP/fork-sync.XXXXXX")"
+      - name: Read remote branches and tags
+        id: refs
+        run: |
+          set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
 
           # 只查询引用，不下载 Git 对象。--refs 排除附注 tag 的剥离行。
           git ls-remote --refs "$UPSTREAM" \
@@ -57,32 +84,190 @@ jobs:
           git ls-remote --refs "$TARGET_URL" \
             'refs/heads/*' 'refs/tags/*' > "$SYNC_DIR/fork.refs"
 
+      - name: Check whether synchronization is needed
+        id: compare
+        run: |
+          set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
+
+          CHANGED_REFS="$SYNC_DIR/changed.refs"
+
           # 仅检查上游存在的引用；fork 独有的引用不构成同步条件。
           # 使用 FILENAME 判断文件，兼容目标仓库没有任何引用的情况。
           awk '
             FILENAME == ARGV[1] { target[$2] = $1; next }
             target[$2] != $1 { print $2 }
           ' "$SYNC_DIR/fork.refs" "$SYNC_DIR/upstream.refs" \
-            > "$SYNC_DIR/changed.refs"
+            > "$CHANGED_REFS"
+          DIFF_COUNT="$(awk 'END { print NR + 0 }' "$CHANGED_REFS")"
+          printf 'diff_count=%s\n' "$DIFF_COUNT" >> "$GITHUB_OUTPUT"
 
-          if [[ ! -s "$SYNC_DIR/changed.refs" ]]; then
+          if [[ ! -s "$CHANGED_REFS" ]]; then
+            echo 'needs_sync=false' >> "$GITHUB_OUTPUT"
             echo "无需同步：$TARGET_REPO 的上游引用均已一致。"
             exit 0
           fi
 
+          echo 'needs_sync=true' >> "$GITHUB_OUTPUT"
           echo "以下引用存在差异："
-          cat "$SYNC_DIR/changed.refs"
+          cat "$CHANGED_REFS"
           echo "同步方向：$UPSTREAM -> $TARGET_REPO"
+
+      - name: Fetch upstream branches and tags
+        id: fetch
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
 
           # 仅在检查到差异后下载所有分支和 tags
           git init --bare "$SYNC_DIR/repository.git"
-          cd "$SYNC_DIR/repository.git"
-
-          git fetch --no-tags "$UPSTREAM" \
+          git -C "$SYNC_DIR/repository.git" fetch --no-tags "$UPSTREAM" \
             'refs/heads/*:refs/heads/*' \
             'refs/tags/*:refs/tags/*'
+
+      - name: Push branches and tags to fork
+        id: push
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          set -euo pipefail
+          trap 'printf "exit_code=%s\n" "$?" >> "$GITHUB_OUTPUT"' EXIT
 
           # 不强制覆盖、不删除目标引用；任一更新失败则本次全部不更新。
-          git push --atomic "$TARGET_URL" \
+          git -C "$SYNC_DIR/repository.git" push --atomic "$TARGET_URL" \
             'refs/heads/*:refs/heads/*' \
             'refs/tags/*:refs/tags/*'
+
+      - name: Save compact synchronization result
+        id: result
+        if: ${{ always() }}
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+          RESULT_FILE: ${{ runner.temp }}/fork-sync-result-${{ strategy.job-index }}.json
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          steps = json.loads(os.environ["STEPS_JSON"])
+          stages = {
+              "prepare": "检查令牌并准备目录",
+              "upstream": "查询上游",
+              "auth": "配置 Git 认证",
+              "refs": "读取远端引用",
+              "compare": "比较引用",
+              "fetch": "获取上游对象",
+              "push": "推送到 fork",
+          }
+          outcomes = {key: steps.get(key, {}).get("outcome", "skipped") for key in stages}
+          comparison = steps.get("compare", {}).get("outputs", {})
+          if "failure" in outcomes.values():
+              result = "失败"
+          elif "cancelled" in outcomes.values():
+              result = "已取消"
+          elif outcomes["push"] == "success":
+              result = "同步成功"
+          elif comparison.get("needs_sync") == "false":
+              result = "无需同步"
+          else:
+              result = "未完成"
+
+          failed = next((key for key in stages if outcomes[key] in {"failure", "cancelled"}), None)
+          count = comparison.get("diff_count")
+          record = {
+              "repo": os.environ["TARGET_REPO"],
+              "upstream": os.environ.get("UPSTREAM"),
+              "result": result,
+              "diff_count": int(count) if count else None,
+              "failed_stage": stages.get(failed),
+              "exit_code": steps.get(failed, {}).get("outputs", {}).get("exit_code"),
+          }
+          Path(os.environ["RESULT_FILE"]).write_text(
+              json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload temporary result file
+        if: ${{ always() && steps.result.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          # 仅上传单个小 JSON；archive=false 时文件名即 artifact 名称。
+          path: ${{ runner.temp }}/fork-sync-result-${{ strategy.job-index }}.json
+          archive: false
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+  summary:
+    name: Summarize all forks
+    needs: sync
+    if: ${{ always() }}
+    runs-on: ubuntu-slim
+    permissions:
+      actions: read
+
+    steps:
+      - name: Download temporary result files
+        id: download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: fork-sync-result-*.json
+          path: ${{ runner.temp }}/fork-sync-results
+          merge-multiple: true
+
+      - name: Write consolidated summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RESULTS_DIR: ${{ runner.temp }}/fork-sync-results
+          EXPECTED_REPOS: ${{ vars.FORK_REPOS }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
+
+          expected = json.loads(os.environ["EXPECTED_REPOS"])
+          records = {}
+          for path in Path(os.environ["RESULTS_DIR"]).glob("fork-sync-result-*.json"):
+              record = json.loads(path.read_text(encoding="utf-8"))
+              records[record["repo"]] = record
+
+          rows = [records.get(repo, {"repo": repo, "result": "缺少结果"}) for repo in expected]
+          counts = Counter(row["result"] for row in rows)
+          statuses = ["同步成功", "无需同步", "失败", "已取消", "未完成", "缺少结果"]
+          lines = [
+              "# Fork 同步汇总", "",
+              f"共 {len(rows)} 个仓库。", "",
+              "| 状态 | 仓库数 |", "| --- | ---: |",
+              *(f"| {status} | {counts[status]} |" for status in statuses), "",
+              "| 仓库 | 上游 | 结果 | 差异引用数 | 失败阶段 | 退出码 |",
+              "| --- | --- | --- | ---: | --- | --- |",
+          ]
+          for row in rows:
+              repo = row["repo"]
+              upstream = row.get("upstream")
+              if upstream:
+                  url = upstream.removesuffix(".git")
+                  upstream = f"[{url.removeprefix('https://github.com/')}]({url})"
+              count = row.get("diff_count")
+              lines.append(
+                  f"| [{repo}](https://github.com/{repo}) | {upstream or '—'} "
+                  f"| {row['result']} | {count if count is not None else '—'} "
+                  f"| {row.get('failed_stage') or '—'} | {row.get('exit_code') or '—'} |"
+              )
+          lines.extend(["", "引用明细及错误信息见各仓库任务日志。"])
+          if os.environ["DOWNLOAD_OUTCOME"] != "success":
+              lines.extend(["", "结果文件下载失败，请检查下载步骤的任务日志。"])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+
+          if counts["缺少结果"] or os.environ["DOWNLOAD_OUTCOME"] != "success":
+              raise SystemExit("汇总结果不完整，请检查结果文件的上传和下载步骤。")
+          PY
